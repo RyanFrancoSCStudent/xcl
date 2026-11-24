@@ -2868,12 +2868,19 @@ fn check_mesh_mode_two_passes(vertex_pull: bool) {
     let code = prog(&refs);
     let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
-    let pass = if vertex_pull { super::vertex_pull::vertex_pull(&ms, None).unwrap() } else { mesh_passthrough(&ms) };
     let profile = if vertex_pull { "vs_6_6" } else { "ms_6_6" };
-    let msb = dxc::compile(&pass, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
     let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let (cs, msb) = if vertex_pull {
+        let compiled = super::pso::finish_vertex_pull(t, ms.clone(), Some(&ps)).unwrap();
+        assert_eq!(compiled.draw_vertices(2), Ok(768));
+        (compiled.cs, compiled.vs)
+    } else {
+        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let pass = mesh_passthrough(&ms);
+        let msb = dxc::compile(&pass, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        (cs, msb)
+    };
     // vertex table at byte 0x100, V# in s[16:19] (stride 16, 3 records)
     let mut mem = vec![0u32; 256];
     for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {

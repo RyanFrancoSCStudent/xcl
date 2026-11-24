@@ -3324,7 +3324,7 @@ const BIG_DRIVER_COMPILE: usize = 256 << 10;
 struct Slots {
     n: Mutex<usize>,
     cv: std::sync::Condvar,
-    most: usize,
+    most: fn() -> usize,
 }
 
 struct SlotGuard(&'static Slots);
@@ -3332,7 +3332,8 @@ struct SlotGuard(&'static Slots);
 impl Slots {
     fn acquire(&'static self) -> SlotGuard {
         let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
+        let most = (self.most)();
+        while *n >= most {
             n = self.cv.wait(n).unwrap();
         }
         *n += 1;
@@ -3347,7 +3348,22 @@ impl Drop for SlotGuard {
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: big_compiles };
+
+/// Big background driver compiles at once: 1, or `XCL_BIG_COMPILES` (1 – 16). One at a time keeps
+/// the commit of a Windows machine with a small page file in bounds; with the RAM for it more can
+/// run – under Wine + vkd3d-proton each big compute program takes 50 – 120 s through dxil-spirv and
+/// the driver, so a retail title's world-load backlog of them queued behind a single slot.
+fn big_compiles() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("XCL_BIG_COMPILES").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 16);
+        if n > 1 {
+            crate::xlog_info!("D3D12.X: XCL_BIG_COMPILES={n}: up to {n} big compute pipelines built by the driver at once");
+        }
+        n
+    })
+}
 
 /// Before a big driver compile in the background: until 3 GB of commit are free (each takes
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).

@@ -1077,6 +1077,28 @@ pub fn mesh_draw_split(
     size: u32,
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    mesh_draw_impl(cs, ms, ps, groups, split, None, record_dwords, sgprs, mem, size, clear)
+}
+
+/// Experimental test runner for compute-generated records drawn as a triangle list.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_vertex_draw(
+    cs: &[u8], vs: &[u8], ps: &[u8], groups: u32, record: &super::MsInterface,
+    sgprs: &[u32], mem: &[u32], size: u32, clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    if groups == 0 || groups > 65535 {
+        return Err("invalid mesh fallback group count".into());
+    }
+    let count = super::vertex_pull::draw_vertices(record, groups).map_err(str::to_owned)?;
+    mesh_draw_impl(cs, vs, ps, groups, 1, Some(count), record.record_dwords(), sgprs, mem, size, clear)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mesh_draw_impl(
+    cs: &[u8], ms: &[u8], ps: &[u8], groups: u32, split: u32,
+    vertex_count: Option<u32>, record_dwords: usize, sgprs: &[u32],
+    mem: &[u32], size: u32, clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
@@ -1088,29 +1110,49 @@ pub fn mesh_draw_split(
                 ..Default::default()
             })
             .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-        let mut blend = D3D12_BLEND_DESC::default();
-        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-        let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
-        let mut rtv_formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
-        rtv_formats.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        let mut stream = MeshStream {
-            rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: gpu.rs.as_raw() },
-            ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr() as _, BytecodeLength: ms.len() } },
-            ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() } },
-            blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
-            mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
-            rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
-            depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
-            rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
-            samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
+        let graphics_rs = if vertex_count.is_some() { root_signature(dev, true)? } else { gpu.rs.clone() };
+        let mpso: ID3D12PipelineState = if vertex_count.is_some() {
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&graphics_rs),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr() as _, BytecodeLength: ms.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = true.into();
+            pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState (mesh fallback): {x}"))?
+        } else {
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
+            let mut rtv_formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+            rtv_formats.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            let mut stream = MeshStream {
+                rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: gpu.rs.as_raw() },
+                ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr() as _, BytecodeLength: ms.len() } },
+                ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() } },
+                blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
+                mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
+                rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+                depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
+                rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
+                samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
+            };
+            let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
+            dev2
+                .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: std::mem::size_of::<MeshStream>(),
+                    pPipelineStateSubobjectStream: &mut stream as *mut MeshStream as *mut std::ffi::c_void,
+                })
+                .map_err(|x| format!("CreatePipelineState (mesh): {x}"))?
         };
-        let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
-        let mpso: ID3D12PipelineState = dev2
-            .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
-                SizeInBytes: std::mem::size_of::<MeshStream>(),
-                pPipelineStateSubobjectStream: &mut stream as *mut MeshStream as *mut std::ffi::c_void,
-            })
-            .map_err(|x| format!("CreatePipelineState (mesh): {x}"))?;
 
         let tex = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -1183,7 +1225,7 @@ pub fn mesh_draw_split(
         list.ResourceBarrier(&[uav_barrier(&res_buf)]);
         // pass 2: rasterise the records
         list.SetPipelineState(&mpso);
-        list.SetGraphicsRootSignature(&gpu.rs);
+        list.SetGraphicsRootSignature(&graphics_rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
@@ -1191,8 +1233,13 @@ pub fn mesh_draw_split(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
-        list6.DispatchMesh(groups * split, 1, 1);
+        if let Some(count) = vertex_count {
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(count, 1, 0, 0);
+        } else {
+            let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
+            list6.DispatchMesh(groups * split, 1, 1);
+        }
         list.ResourceBarrier(&[
             transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),

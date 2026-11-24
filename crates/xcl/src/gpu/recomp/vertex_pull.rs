@@ -135,4 +135,56 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}\n{h}")).is_empty());
         }
     }
+
+    #[test]
+    fn fallback_gpu_rasterizes_records() {
+        use super::super::{dxc, runner};
+        let adapter = runner::adapter().expect("D3D12 adapter required");
+        println!("mesh fallback adapter: {adapter}");
+        assert!(!adapter.contains("WARP"), "hardware adapter required");
+        let m = MsInterface {
+            outputs: vec![sig("SV_Position", 1, 0)],
+            threads: 1, max_vertices: 3, max_primitives: 3,
+        };
+        // Each record: 4 header dwords, 12 vertex dwords, 3 primitive dwords.
+        // Group zero draws on the left; group one has only invalid primitives.
+        let cs = r#"
+RWByteAddressBuffer res : register(u1);
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {
+    uint b = gid.x * 76u;
+    float x = gid.x == 0u ? -0.5 : 0.5;
+    res.Store4(b, uint4(3u, 2u, 0u, 0u));
+    res.Store4(b + 16u, asuint(float4(x - 0.4, -0.5, 0.5, 1.0)));
+    res.Store4(b + 32u, asuint(float4(x + 0.4, -0.5, 0.5, 1.0)));
+    res.Store4(b + 48u, asuint(float4(x, 0.5, 0.5, 1.0)));
+    res.Store(b + 64u, gid.x == 0u ? 0x00200400u : 0x80200400u);
+    res.Store(b + 68u, 0x00300400u);
+    res.Store(b + 72u, 0x00200400u);
+}
+"#;
+        let vs = vertex_pull(&m, None).unwrap();
+        let ps = "float4 main() : SV_Target0 { return float4(1, 0, 0, 1); }";
+        let cs = dxc::compile(cs, "main", "cs_6_6", &[]).unwrap();
+        let vs = dxc::compile(&vs, "main", "vs_6_6", &[]).unwrap();
+        let ps = dxc::compile(ps, "main", "ps_6_6", &[]).unwrap();
+        let (pixels, records) = runner::mesh_vertex_draw(
+            &cs, &vs, &ps, 2, &m, &[], &[], 64, [0.0, 0.0, 0.0, 1.0],
+        ).unwrap();
+        assert_eq!(records.len(), 38);
+        assert_eq!(&records[0..2], &[3, 2]);
+        assert_eq!(&records[19..21], &[3, 2]);
+        assert_eq!(pixels.len(), 4096);
+        assert_eq!(pixels[32 * 64 + 16], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pixels[32 * 64 + 48], [0.0, 0.0, 0.0, 1.0]);
+        let red = pixels.iter().filter(|p| p[0] > 0.5).count();
+        assert!((250..400).contains(&red), "unexpected triangle coverage: {red}");
+        for y in 0..64 {
+            for x in 32..64 {
+                assert_eq!(pixels[y * 64 + x], [0.0, 0.0, 0.0, 1.0],
+                    "invalid triangle rendered at {x},{y}");
+            }
+        }
+        println!("mesh-free GPU draw: {red} red pixels; invalid records clipped");
+    }
 }

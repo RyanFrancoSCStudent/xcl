@@ -2811,6 +2811,19 @@ fn gpu_mesh_mode_two_passes() {
     if !gpu_ready() || !mesh_ready() {
         return;
     }
+    check_mesh_mode_two_passes(false);
+}
+
+#[test]
+fn vertex_pull_translated_ngg_two_passes() {
+    let adapter = runner::adapter().expect("D3D12 adapter required");
+    assert!(!adapter.contains("WARP"), "hardware adapter required");
+    assert_eq!(runner::wave64_programs_supported(), Ok(true));
+    println!("translated NGG vertex pull on {adapter}");
+    check_mesh_mode_two_passes(true);
+}
+
+fn check_mesh_mode_two_passes(vertex_pull: bool) {
     use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
     let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
         name: name.into(),
@@ -2856,8 +2869,9 @@ fn gpu_mesh_mode_two_passes() {
     let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
-    let pass = mesh_passthrough(&ms);
-    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let pass = if vertex_pull { super::vertex_pull::vertex_pull(&ms, None).unwrap() } else { mesh_passthrough(&ms) };
+    let profile = if vertex_pull { "vs_6_6" } else { "ms_6_6" };
+    let msb = dxc::compile(&pass, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
     let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
     // vertex table at byte 0x100, V# in s[16:19] (stride 16, 3 records)
@@ -2867,7 +2881,11 @@ fn gpu_mesh_mode_two_passes() {
     }
     let mut sg = vec![0u32; 128];
     sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
-    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let (px, rec) = if vertex_pull {
+        runner::mesh_vertex_draw(&cs, &msb, &ps, 2, &ms, &sg, &mem, 32, [-1.0; 4])
+    } else {
+        runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4])
+    }.unwrap();
     let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
     for g in 0..2usize {
         let r = &rec[g * rd..(g + 1) * rd];
@@ -2891,11 +2909,15 @@ fn gpu_mesh_mode_two_passes() {
     let ins: Vec<crate::gpu::dxbc::SigElement> = (0..16).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
     let split = super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins)));
     assert_eq!(split, 4);
-    let pass16 = super::emit::mesh_passthrough_for(&ms, Some(&ins));
-    let msb16 = dxc::compile(&pass16, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
+    let pass16 = if vertex_pull { super::vertex_pull::vertex_pull(&ms, Some(&ins)).unwrap() } else { super::emit::mesh_passthrough_for(&ms, Some(&ins)) };
+    let msb16 = dxc::compile(&pass16, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
     let fields: String = (0..16).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
-    let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let (px16, _) = if vertex_pull {
+        runner::mesh_vertex_draw(&cs, &msb16, &ps16, 2, &ms, &sg, &mem, 32, [-1.0; 4])
+    } else {
+        runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4])
+    }.unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 

@@ -4316,6 +4316,27 @@ mod mesh_slot_tests {
         s
     }
 
+    #[test]
+    fn vertex_pull_stream_replaces_mesh_stages_and_keeps_state() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let ps = b"DXBC-pixel";
+        let vs = b"DXBC-vertex";
+        let mut stream = as_slot_ms_stream(&ms, ps);
+        stream.extend_from_slice(&sub(14, &1u32.to_le_bytes())); // old point topology
+        let subs = super::stream_subobjects(&stream).unwrap();
+        let out = super::geometry_raster_stream(&subs, std::ptr::null_mut(), vs, Some(ps), true);
+        let out = super::stream_subobjects(&out.0).unwrap();
+        let find = |ty| out.iter().find(|s| s.0 == ty).unwrap().1;
+        assert_eq!(unsafe { super::payload_shader(find(1)) }.unwrap(), vs);
+        assert_eq!(unsafe { super::payload_shader(find(2)) }.unwrap(), ps);
+        assert!(!out.iter().any(|s| matches!(s.0, 24 | 25)));
+        assert_eq!(out.iter().filter(|s| s.0 == 14).count(), 1);
+        assert_eq!(u32::from_le_bytes(find(14).try_into().unwrap()), 3);
+        for ty in [8, 9, 10, 11, 15, 17] {
+            assert_eq!(find(ty), subs.iter().find(|s| s.0 == ty).unwrap().1);
+        }
+    }
+
     /// The stand-in for a console MS alone in the AS slot is a mesh pipeline: the subobject is
     /// retyped to MS with the dummy MS (as `translated_mesh_stream` reads the title's stream),
     /// the PS is the dummy PS. Left an empty AS and a PS, the stream had neither an MS nor a VS
@@ -4408,6 +4429,42 @@ mod mesh_slot_tests {
     }
 }
 
+/// Rewrite a mesh stream for either raster stage, retaining the title's graphics state.
+/// The vertex path deliberately does not activate live draw routing.
+fn geometry_raster_stream(subs: &[(u32, &[u8])], rs: *mut c_void, stage: &[u8], ps: Option<&[u8]>, vertex_pull: bool) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(if vertex_pull { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS } else { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS }, stage);
+    if vertex_pull {
+        // D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY = 14.
+        out.raw(14, &(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32).to_le_bytes(), false);
+    }
+    if let Some(p) = ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
+    }
+    for (ty, payload) in subs {
+        let skip = [0, 2, 19, 24, 25].contains(ty)
+            || (vertex_pull && [1, 3, 4, 5, 6, 7, 12, 13, 14].contains(ty));
+        // In the VS path, remove old shader stages, stream output, IA layout,
+        // strip cut and primitive topology; the generated VS has no inputs.
+        if !skip {
+            let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+            // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
+            if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
+                let mut p = payload.to_vec();
+                for k in 0..if *ty == 15 { 8 } else { 1 } {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                    p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                }
+                out.raw(*ty, &p, palign == 8);
+                continue;
+            }
+            out.raw(*ty, payload, palign == 8);
+        }
+    }
+    out
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4467,30 +4524,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
-    // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
-    for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
-        if !skip {
-            let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
-            // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
-            if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
-                let mut p = payload.to_vec();
-                for k in 0..if *ty == 15 { 8 } else { 1 } {
-                    let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
-                    p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
-                }
-                out.raw(*ty, &p, palign == 8);
-                continue;
-            }
-            out.raw(*ty, payload, palign == 8);
-        }
-    }
+    let out = geometry_raster_stream(&subs, rs, &tp.ms, ps.as_deref(), false);
     Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
 }
 

@@ -55,6 +55,7 @@ pub mod dxc;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod vertex_pull;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;

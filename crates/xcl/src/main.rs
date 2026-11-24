@@ -38,6 +38,9 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl doctor [--json]
+      Checks the selected GPU, DXC and system XGameRuntime without launching a game.
+      XCL_ADAPTER selects an adapter. Exit 0 = no errors or warnings, 1 = errors, 2 = warnings.
   xcl --version
 ";
 
@@ -52,6 +55,24 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
+        Some("doctor") if args.len() == 1 || (args.len() == 2 && args[1] == "--json") => {
+            let checks = xcl::preflight::run("auto");
+            if args.len() == 2 {
+                match serde_json::to_string_pretty(&checks) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => {
+                        eprintln!("Cannot serialize diagnostic checks: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                xcl::preflight::print(&checks);
+            }
+            use xcl::preflight::Level;
+            if checks.iter().any(|c| c.level == Level::Error) { 1 }
+            else if checks.iter().any(|c| c.level == Level::Warning) { 2 }
+            else { 0 }
+        }
         Some("run") if args.len() >= 2 => {
             let rest: Vec<String> = match args.iter().position(|a| a == "--") {
                 Some(i) => args[i + 1..].to_vec(),

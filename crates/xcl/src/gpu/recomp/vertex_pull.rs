@@ -178,7 +178,9 @@ void main(uint3 gid : SV_GroupID) {
         assert_eq!(pixels[32 * 64 + 16], [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(pixels[32 * 64 + 48], [0.0, 0.0, 0.0, 1.0]);
         let red = pixels.iter().filter(|p| p[0] > 0.5).count();
-        assert!((250..400).contains(&red), "unexpected triangle coverage: {red}");
+        // NDC width 0.8 and height 1.0 become 25.6 by 32 pixels.
+        // Triangle area is 409.6 pixels; allow a small rasterization tolerance.
+        assert!((390..=430).contains(&red), "unexpected triangle coverage: {red}");
         for y in 0..64 {
             for x in 32..64 {
                 assert_eq!(pixels[y * 64 + x], [0.0, 0.0, 0.0, 1.0],

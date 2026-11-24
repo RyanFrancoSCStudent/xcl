@@ -545,9 +545,38 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
     Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
 }
 
-/// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
-/// the pixel shader `ps` (its container: console or PC) reads.
-pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+/// A mesh-free variant of the two-pass pipeline. Its second pass is a normal
+/// vertex shader, never a mesh shader. The command-list caller must bind the
+/// record UAV, synchronize compute writes, and issue a triangle-list draw.
+pub struct VertexPullTwoPass {
+    pub cs: Vec<u8>,
+    pub vs: Vec<u8>,
+    pub record: super::MsInterface,
+    pub samplers: Vec<StaticSampler>,
+}
+
+impl VertexPullTwoPass {
+    pub fn draw_vertices(&self, groups: u32) -> Result<u32, &'static str> {
+        super::vertex_pull::draw_vertices(&self.record, groups)
+    }
+}
+
+/// Compile both stages with the same record and signature ABI as native mesh.
+/// This does not itself install a live pipeline or issue any commands.
+pub(crate) fn finish_vertex_pull(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<VertexPullTwoPass, String> {
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let source = super::vertex_pull::vertex_pull(&record, ps_inputs.as_deref()).map_err(str::to_owned)?;
+    let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
+    let vs = dxc::compile_cached(&source, "main", "vs_6_6")?.0;
+    Ok(VertexPullTwoPass { cs, vs, record, samplers: t.static_samplers })
+}
+
+/// Decode and translate the console mesh container, independent of raster stage.
+fn translate_console_mesh(blob: &[u8], split_wave64: bool) -> Result<(super::Translation, super::MsInterface), String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -555,7 +584,20 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, mem_windows())?, record, ps)
+    let t = super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, mem_windows())?;
+    Ok((t, record))
+}
+
+/// The existing native mesh path.
+pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    let (t, record) = translate_console_mesh(blob, split_wave64)?;
+    finish_two_pass(t, record, ps)
+}
+
+/// Experimental mesh-free compilation path for the same console container.
+pub fn console_mesh_vertex_pull(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<VertexPullTwoPass, String> {
+    let (t, record) = translate_console_mesh(blob, split_wave64)?;
+    finish_vertex_pull(t, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
